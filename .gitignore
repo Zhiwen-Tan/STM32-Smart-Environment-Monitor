@@ -19,8 +19,8 @@ List.
 *.uvguix.*
 *.uvgui.*
 *.uvopt
-*.uvproj
 *.uvoptx
+*.uvproj
 *.uvprojx
 *.scvd
 *.dbgconf
@@ -36,6 +36,9 @@ List.
 *.browse
 *.o.d
 *.crf.d
+
+# Reference Examples
+01-0.96OLED显示屏STM32F103C8T6_IIC例程/
 
 # STM32CubeMX
 .mxproject
