@@ -26,7 +26,7 @@ List.
 *.dbgconf
 *.dbgdt
 *.ini
-*.txt
+# *.txt (Allow txt files for documentation)
 *.old
 *.bak
 *.Administrator
