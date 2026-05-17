@@ -132,6 +132,15 @@ ControlRule_t rules[MAX_RULES];
 #define UART_RX_BUF_SIZE 128
 char uart_rx_buffer[UART_RX_BUF_SIZE];
 uint8_t uart_rx_index = 0;
+
+// ESP8266 USART3 Buffer
+char rx3_buffer[256];
+uint16_t rx3_len = 0;
+uint8_t rx3_char = 0;
+uint32_t last_rx3_tick = 0;
+uint32_t last_cloud_tick = 0;
+uint32_t last_heartbeat_tick = 0; // 新增独立的心跳定时器
+uint8_t current_cmd_source = 0; // 0 for USART1, 1 for USART3 (ESP8266)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -149,6 +158,7 @@ void Save_Rules_To_Flash(void);
 void Load_Rules_From_Flash(void);
 void Print_Help(void);
 int strcasecmp_custom(const char *s1, const char *s2);
+void ESP8266_Init(void);
 void Save_Rules_To_Flash(void)
 {
     HAL_FLASH_Unlock();
@@ -219,14 +229,25 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
 /* USER CODE BEGIN 0 */
 void UART_Log(const char *fmt, ...)
 {
-  char buf[128];
+  char buf[256];
   va_list args;
   va_start(args, fmt);
   int len = vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
   if (len > 0)
   {
+    // Always print to USART1
     HAL_UART_Transmit(&huart1, (uint8_t *)buf, len, 100);
+    
+    // If the command came from ESP8266 (USART3), send feedback back
+    if (current_cmd_source == 1)
+    {
+        char at_cmd[32];
+        int at_len = snprintf(at_cmd, sizeof(at_cmd), "AT+CIPSEND=0,%d\r\n", len);
+        HAL_UART_Transmit(&huart3, (uint8_t *)at_cmd, at_len, 100);
+        HAL_Delay(20);
+        HAL_UART_Transmit(&huart3, (uint8_t *)buf, len, 100);
+    }
   }
 }
 
@@ -383,7 +404,7 @@ void Delete_All_Actuator_Rules(Actuator_t act)
 void Process_Command(char *cmd)
 {
     // Echo the original string
-    UART_Log("Echo: %s\r\n", cmd);
+    // UART_Log("Echo: %s\r\n", cmd);
 
     // Remove trailing \r or \n
     char *p = cmd + strlen(cmd) - 1;
@@ -587,7 +608,7 @@ void Process_Command(char *cmd)
     }
     else
     {
-        UART_Log("Invalid Format\r\n");
+        // UART_Log("Invalid Format\r\n");
     }
 }
 
@@ -671,6 +692,61 @@ void Apply_Rules(void)
     }
 }
 
+void ESP8266_Init(void) 
+{ 
+    // 1. 强制 Station 模式 
+    HAL_UART_Transmit(&huart3, (uint8_t *)"AT+CWMODE=1\r\n", strlen("AT+CWMODE=1\r\n"), 100); HAL_Delay(500); 
+    
+    // 2. 硬件复位重启 
+    HAL_UART_Transmit(&huart3, (uint8_t *)"AT+RST\r\n", strlen("AT+RST\r\n"), 100); HAL_Delay(3000); 
+    
+    // 3. 连手机热点 
+    HAL_UART_Transmit(&huart3, (uint8_t *)"AT+CWJAP=\"Mi 10S\",\"11223344\"\r\n", strlen("AT+CWJAP=\"Mi 10S\",\"11223344\"\r\n"), 100); HAL_Delay(7000); 
+    
+    // 4. 🚨 开启巴法云 TCP 必需的硬件级透传模式 
+    HAL_UART_Transmit(&huart3, (uint8_t *)"AT+CIPMODE=1\r\n", strlen("AT+CIPMODE=1\r\n"), 100); HAL_Delay(500); 
+    
+    // 5. 冲击巴法云 TCP 创客云 8344 端口（绝对不是MQTT） 
+    HAL_UART_Transmit(&huart3, (uint8_t *)"AT+CIPSTART=\"TCP\",\"bemfa.com\",8344\r\n", strlen("AT+CIPSTART=\"TCP\",\"bemfa.com\",8344\r\n"), 100); HAL_Delay(3000); 
+    
+    // 6. 🚨 激活透传发送流 
+    HAL_UART_Transmit(&huart3, (uint8_t *)"AT+CIPSEND\r\n", strlen("AT+CIPSEND\r\n"), 100); HAL_Delay(500); 
+    
+    // 7. 顺着透传管道，发送带 \r\n 强力尾部补刀的订阅控制暗号 
+    HAL_UART_Transmit(&huart3, (uint8_t *)"cmd=1&uid=92bb8b17fdf24e90b7817b36e797cf85&topic=Pump006\r\n", strlen("cmd=1&uid=92bb8b17fdf24e90b7817b36e797cf85&topic=Pump006\r\n"), 100); HAL_Delay(200); 
+    HAL_UART_Transmit(&huart3, (uint8_t *)"cmd=1&uid=92bb8b17fdf24e90b7817b36e797cf85&topic=Beep006\r\n", strlen("cmd=1&uid=92bb8b17fdf24e90b7817b36e797cf85&topic=Beep006\r\n"), 100); HAL_Delay(200); 
+}
+
+void Upload_Data_To_Cloud(float t, float h, int light, float soil) 
+{ 
+    char pData[128]; 
+    char pSendCmd[32]; 
+    
+    // 1. 上传温度到 Temperature004 
+    sprintf(pData, "cmd=2&uid=92bb8b17fdf24e90b7817b36e797cf85&topic=Temperature004&msg=%.1f\r\n", t); 
+    sprintf(pSendCmd, "AT+CIPSEND=%d\r\n", strlen(pData)); 
+    HAL_UART_Transmit(&huart3, (uint8_t *)pSendCmd, strlen(pSendCmd), 100); HAL_Delay(200); 
+    HAL_UART_Transmit(&huart3, (uint8_t *)pData, strlen(pData), 200); HAL_Delay(200); 
+
+    // 2. 上传空气湿度到 AirHumidity004 
+    sprintf(pData, "cmd=2&uid=92bb8b17fdf24e90b7817b36e797cf85&topic=AirHumidity004&msg=%.1f\r\n", h); 
+    sprintf(pSendCmd, "AT+CIPSEND=%d\r\n", strlen(pData)); 
+    HAL_UART_Transmit(&huart3, (uint8_t *)pSendCmd, strlen(pSendCmd), 100); HAL_Delay(200); 
+    HAL_UART_Transmit(&huart3, (uint8_t *)pData, strlen(pData), 200); HAL_Delay(200); 
+
+    // 3. 上传光照度到 Light004 
+    sprintf(pData, "cmd=2&uid=92bb8b17fdf24e90b7817b36e797cf85&topic=Light004&msg=%d\r\n", light); 
+    sprintf(pSendCmd, "AT+CIPSEND=%d\r\n", strlen(pData)); 
+    HAL_UART_Transmit(&huart3, (uint8_t *)pSendCmd, strlen(pSendCmd), 100); HAL_Delay(200); 
+    HAL_UART_Transmit(&huart3, (uint8_t *)pData, strlen(pData), 200); HAL_Delay(200); 
+
+    // 4. 上传土壤湿度到 SoilHumidity004 
+    sprintf(pData, "cmd=2&uid=92bb8b17fdf24e90b7817b36e797cf85&topic=SoilHumidity004&msg=%.1f\r\n", soil); 
+    sprintf(pSendCmd, "AT+CIPSEND=%d\r\n", strlen(pData)); 
+    HAL_UART_Transmit(&huart3, (uint8_t *)pSendCmd, strlen(pSendCmd), 100); HAL_Delay(200); 
+    HAL_UART_Transmit(&huart3, (uint8_t *)pData, strlen(pData), 200); HAL_Delay(200); 
+}
+
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1)
@@ -688,6 +764,23 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             uart_rx_buffer[uart_rx_index++] = (char)uart_rx_char;
         }
         HAL_UART_Receive_IT(&huart1, &uart_rx_char, 1);
+    }
+    else if (huart->Instance == USART3)
+    {
+        if (rx3_len < 256 - 1)
+        {
+            rx3_buffer[rx3_len++] = (char)rx3_char;
+            rx3_buffer[rx3_len] = '\0';
+            last_rx3_tick = HAL_GetTick();
+        }
+        else
+        {
+            rx3_len = 0;
+            rx3_buffer[rx3_len++] = (char)rx3_char;
+            rx3_buffer[rx3_len] = '\0';
+            last_rx3_tick = HAL_GetTick();
+        }
+        HAL_UART_Receive_IT(&huart3, &rx3_char, 1);
     }
 }
 /* USER CODE END 0 */
@@ -726,6 +819,7 @@ int main(void)
   MX_ADC1_Init();
   MX_I2C1_Init();
   MX_USART1_UART_Init();
+  MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
   OLED_Init();
   OLED_Clear();
@@ -736,6 +830,7 @@ int main(void)
   
   // Start UART Interrupt Reception
   HAL_UART_Receive_IT(&huart1, &uart_rx_char, 1);
+  HAL_UART_Receive_IT(&huart3, &rx3_char, 1);
   
   // ADC Calibration for F1 series
   HAL_ADCEx_Calibration_Start(&hadc1);
@@ -747,6 +842,8 @@ int main(void)
   OLED_ShowString(0, 2, "Pump Protected", 16);
   HAL_Delay(500); // Short delay for user to see the message
   
+  ESP8266_Init();
+
   OLED_Clear();
   OLED_ShowString(0, 0, "System Start", 16);
   
@@ -772,9 +869,92 @@ int main(void)
     // 0. Command Handling (Check Serial Port Flag)
     if (cmd_ready)
     {
+        current_cmd_source = 0;
         Process_Command(uart_rx_buffer);
         uart_rx_index = 0;
         cmd_ready = 0;
+    }
+
+    // 0.1 ESP8266 Wi-Fi Command Parsing (Idle Timeout)
+    if (rx3_len > 0 && (HAL_GetTick() - last_rx3_tick > 30))
+    {
+        // ================= 1. 巴法云标准App/小程序按钮控制拦截 ================= 
+        if (strstr((char*)rx3_buffer, "msg=on") != NULL || strstr((char*)rx3_buffer, "msg=off") != NULL) 
+        { 
+            current_cmd_source = 1; 
+            
+            // 1. 水泵控制分流 
+            if (strstr((char*)rx3_buffer, "topic=Pump006") != NULL) 
+            { 
+                if (strstr((char*)rx3_buffer, "msg=on") != NULL)  
+                { 
+                    manual_pump = 1; // 强行开启 
+                    PUMP_ON(); 
+                } 
+                if (strstr((char*)rx3_buffer, "msg=off") != NULL) 
+                { 
+                    manual_pump = 0; // 🚨 核心修改：点击关闭后直接回到 auto 模式！ 
+                    // 这里不需要手动调 PUMP_OFF()，下一行的 Apply_Rules() 会根据传感器阈值自动判定该开还是该关 
+                } 
+            } 
+            // 2. 蜂鸣器控制分流 
+            else if (strstr((char*)rx3_buffer, "topic=Beep006") != NULL) 
+            { 
+                if (strstr((char*)rx3_buffer, "msg=on") != NULL)  
+                { 
+                    manual_buzzer = 1; // 强行开启 
+                    BUZZER_ON(); 
+                } 
+                if (strstr((char*)rx3_buffer, "msg=off") != NULL) 
+                { 
+                    manual_buzzer = 0; // 🚨 核心修改：点击关闭后直接回到 auto 模式！ 
+                } 
+            } 
+            
+            memset(rx3_buffer, 0, sizeof(rx3_buffer)); 
+            rx3_len = 0; 
+            continue; 
+        } 
+    
+        // ================= 2. 核心：巴法云远程无线【文本命令】透传重定向 ================= 
+        // 当我们在巴法云输入框手打命令发送时，原始数据格式为：cmd=2&uid=...&topic=Pump006&msg=PUMP T 25 low 35 high 1 
+        // 我们需要精准提取出 msg= 后面的真正原生指令，然后无缝甩给原本的 Process_Command 处理！ 
+        char *msg_ptr = strstr((char*)rx3_buffer, "msg="); 
+        if (msg_ptr != NULL) 
+        { 
+            msg_ptr += 4; // 跳过 "msg=" 这4个字，直接锁定真正的命令文本 
+            
+            // 强行剔除可能存在的尾部回车换行 
+            size_t cmd_len = strlen(msg_ptr); 
+            while (cmd_len > 0 && (msg_ptr[cmd_len - 1] == '\r' || msg_ptr[cmd_len - 1] == '\n')) 
+            { 
+                msg_ptr[cmd_len - 1] = '\0'; 
+                cmd_len--; 
+            } 
+            
+            if (strlen(msg_ptr) > 0) 
+            { 
+                current_cmd_source = 1;      // 标记指令来自网络，让系统的 UART_Log 能够自动把修改成功的确认信息回传发给云端！ 
+                Process_Command(msg_ptr);    // 无缝调用你原本强大、带Flash保存、OR逻辑的命令解析器！ 
+                current_cmd_source = 0;      // 恢复状态 
+            } 
+            
+            memset(rx3_buffer, 0, sizeof(rx3_buffer)); 
+            rx3_len = 0; 
+            continue; 
+        } 
+    
+        // ================= 3. 系统级垃圾状态拦截 ================= 
+        if (strstr((char*)rx3_buffer, "CONNECT") != NULL || strstr((char*)rx3_buffer, "CLOSED") != NULL || strstr((char*)rx3_buffer, "SEND OK") != NULL) 
+        { 
+            memset(rx3_buffer, 0, sizeof(rx3_buffer)); 
+            rx3_len = 0; 
+            continue; 
+        } 
+        
+        // 未匹配到的其他干扰信息，为了安全也顺手清空
+        memset(rx3_buffer, 0, sizeof(rx3_buffer));
+        rx3_len = 0;
     }
 
     // 1. Get Median Filtered ADC Value from PA2 (Sampling every 1s) - Only when system is not busy
@@ -827,11 +1007,8 @@ int main(void)
         // UART_Log("[Log] Sensor Update: Temp=%d C, Air_Humi=%d %%, Light=%.1f Lux, DHT11_Status=%d\r\n", 
         //        dht_data.temp, dht_data.humi, bh1750_lux, status);
                
-        // 9. Rule-based Control Logic
-        if (manual_buzzer == 0) // Keep this flag if you want a global "mute" but rules usually handle it
-        {
-            Apply_Rules();
-        }
+        // 9. Rule-based Control Logic (Always apply rules to separate logic) 
+        Apply_Rules();
     }
     
     // 7. Update OLED Display (Limited to once per second: 1000ms) - Only when system is not busy
@@ -879,6 +1056,28 @@ int main(void)
         else OLED_ShowString(120, 6, " ", 16);
         
         system_busy = 0; // Unlock
+    }
+    
+    // =================【巴法云定时数据上报】=================
+    // 每 5 秒分别上传四个传感器数据到各自的独立通道
+    if (HAL_GetTick() > 10000 && (HAL_GetTick() - last_cloud_tick >= 5000))
+    {
+        last_cloud_tick = HAL_GetTick();
+        Upload_Data_To_Cloud((float)dht_data.temp, (float)dht_data.humi, (int)bh1750_lux, soil_humidity);
+    }
+    
+    // =================【巴法云控制通道常驻心跳】=================
+    // 🚨 每 20000 毫秒（20秒）强行刷新一次订阅状态，防止服务器踢掉连接，锁死卡片为绿色在线
+    if (HAL_GetTick() - last_heartbeat_tick >= 20000)
+    {
+        last_heartbeat_tick = HAL_GetTick();
+        
+        // 强行刷新水泵控制订阅 
+        HAL_UART_Transmit(&huart3, (uint8_t *)"cmd=1&uid=92bb8b17fdf24e90b7817b36e797cf85&topic=Pump006\r\n", strlen("cmd=1&uid=92bb8b17fdf24e90b7817b36e797cf85&topic=Pump006\r\n"), 100); 
+        HAL_Delay(200); // 稍微歇一会，防止冲爆串口 
+        
+        // 强行刷新蜂鸣器控制订阅 
+        HAL_UART_Transmit(&huart3, (uint8_t *)"cmd=1&uid=92bb8b17fdf24e90b7817b36e797cf85&topic=Beep006\r\n", strlen("cmd=1&uid=92bb8b17fdf24e90b7817b36e797cf85&topic=Beep006\r\n"), 100); 
     }
     
     // 8. Wait for Startup delay
